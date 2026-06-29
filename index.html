@@ -106,8 +106,9 @@
   <div id="overlay">
     <h1>Neural Compass</h1>
     <p>A neural-field ring attractor that path-integrates your phone&rsquo;s heading.
-       Tap Start, allow motion access, then turn your body. The bright bump should
-       track your heading; the thin top line marks north.</p>
+       Tap Start, allow motion access, then turn your body. The bright bump stays pinned at
+       the top &mdash; the way you&rsquo;re facing now &mdash; while the dial and the
+       &ldquo;start&rdquo; marker rotate to show how far you&rsquo;ve turned, like a compass.</p>
     <button id="startBtn" class="primary">Start</button>
     <div id="progressWrap">
       <div id="progressBar"><div id="progressFill"></div></div>
@@ -488,8 +489,13 @@ self.onmessage = function (e) {
   // ---- precomputed ring node angles ------------------------------------
   const nodeAng = new Float64Array(N);
   for (let j = 0; j < N; j++) nodeAng[j] = TWO_PI * j / N;
-  // Map ring angle theta -> canvas angle: north (theta=0) at top, increasing clockwise.
-  function canvasAngle(theta) { return Math.PI / 2 - theta; }
+  // View rotation: each frame we counter-rotate the whole scene by the bump centroid so the
+  // decoded-heading bump stays pinned to the top of the screen — iPhone-compass dial behavior:
+  // the needle holds still and the dial + reference marker rotate as you turn. Set in render().
+  let viewRot = 0;
+  // Map ring angle theta -> canvas angle. theta == viewRot renders at the top; the scene is
+  // rotated by -viewRot so the pinned bump (theta == centroid) sits straight up.
+  function canvasAngle(theta) { return Math.PI / 2 - (theta - viewRot); }
 
   // ---- Worker from inlined blob ----------------------------------------
   const workerSrc = document.getElementById('worker').textContent;
@@ -500,6 +506,9 @@ self.onmessage = function (e) {
   let latestCentroid = 0, latestHeading = 0, latestCommanded = 0;
   let latestGain = NaN, latestSteps = 0, latestRtf = 1, latestMaxr = 0;
   let haveFrame = false, isRunning = false;
+  // refTheta = ring position of the bump on the first live frame = your starting direction.
+  // It is a fixed marker on the dial; the angle from it to the pinned bump = how far you turned.
+  let refTheta = 0, haveRef = false;
 
   worker.onmessage = function (e) {
     const m = e.data;
@@ -515,6 +524,7 @@ self.onmessage = function (e) {
     } else if (m.type === 'frame') {
       latestRate = m.rate;
       latestCentroid = m.centroid; latestHeading = m.heading; latestCommanded = m.commanded;
+      if (!haveRef) { refTheta = m.centroid; haveRef = true; }   // capture the starting direction
       latestGain = m.gain; latestSteps = m.steps; latestRtf = m.rtf; latestMaxr = m.maxr;
       haveFrame = true;
     }
@@ -534,6 +544,7 @@ self.onmessage = function (e) {
   function render() {
     requestAnimationFrame(render);
     if (!haveFrame) return;
+    viewRot = latestCentroid;        // pin the bump to the top; the dial rotates under it
     ctx.clearRect(0, 0, W, H);
     const cx = W / 2, cy = H / 2;
     const R = Math.min(W, H) * 0.43, Rin = R * 0.58;
@@ -559,8 +570,9 @@ self.onmessage = function (e) {
       ctx.fill();
     }
 
-    // north / 0-heading reference line (top)
-    const na = canvasAngle(0);
+    // starting-direction reference (fixed ring location captured at Start). Rotates with the
+    // dial; the gap between it and the pinned bump shows how far you've turned from the start.
+    const na = canvasAngle(refTheta);
     ctx.strokeStyle = 'rgba(230,230,230,0.55)'; ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(cx + Rin * Math.cos(-na), cy + Rin * Math.sin(-na));
@@ -568,7 +580,7 @@ self.onmessage = function (e) {
     ctx.stroke();
     ctx.fillStyle = 'rgba(230,230,230,0.65)';
     ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('N', cx, cy - (R + 22));
+    ctx.fillText('start', cx + (R + 24) * Math.cos(-na), cy + (R + 24) * Math.sin(-na) + 4);
 
     // commanded heading marker (faint amber tick = integral of compass)
     drawTick(cx, cy, R, Rin, latestCommanded, 'rgba(255,183,77,0.6)', 2);
@@ -672,6 +684,7 @@ self.onmessage = function (e) {
   startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
     startBtn.textContent = 'Starting…';
+    haveRef = false;                  // recapture the starting direction for this run
     resize();
     await requestOrientation();             // must be in the user-gesture chain (iOS)
     worker.postMessage({ type: 'start', dev: DEV });
@@ -679,6 +692,7 @@ self.onmessage = function (e) {
   stopBtn.addEventListener('click', () => {
     worker.postMessage({ type: 'stop' });
     isRunning = false;
+    haveRef = false;                  // drop the captured reference; next Start recaptures it
     controls.classList.add('hidden');
     overlay.classList.remove('hidden');
     progressWrap.style.display = 'none';
