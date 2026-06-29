@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>OA Ring-Attractor Path Integrator</title>
+<!--
+  ============================================================================
+  Real-time browser demo: velocity-driven path-integrating Ott-Antonsen (OA/MPR)
+  reduced neural-field RING ATTRACTOR. Single self-contained file. Mobile-first.
+
+  HOW IT WORKS
+    A complex field z(x,t) = <e^{-i theta}> lives on a periodic ring of Nx=256
+    nodes. The phone's compass heading is differentiated to an angular velocity
+    omega; that drives a kernel-asymmetry term B(t)=beta*omega which translates a
+    self-sustaining activity bump around the ring. The decoded bump centroid is a
+    *path integral* of your turning -> a neural compass.
+
+  PORTED FROM (see notes/browser_pathint_implementation_brief.md):
+    src/field.jl, src/moving.jl, src/pathint.jl, scripts/run_pathint.jl
+
+  PERFORMANCE NOTE (why this runs on a phone):
+    The kernel K(x)=0.1+0.3cos x + B sin x has only Fourier modes {0,+1,-1}, so the
+    FFT convolution in field.jl is mathematically equivalent to three running sums
+    per stage (see coupling() in the worker). We use that exact closed form instead
+    of an FFT: identical to round-off, no FFT library, ~10x cheaper. Everything
+    runs in a Web Worker; the UI thread only renders.
+
+  DEPLOY TO GITHUB PAGES
+    1. git add index.html && git commit -m "demo" && git push
+    2. Repo -> Settings -> Pages -> Source: "Deploy from a branch", branch main, /root.
+    3. Open the https://<user>.github.io/<repo>/ URL ON YOUR PHONE.
+       (DeviceOrientation/compass requires HTTPS, which GitHub Pages provides.)
+    4. Tap Start, grant motion/orientation permission, then physically turn around.
+    Dev/self-test mode: append ?dev to the URL to run console assertions + gain test.
+  ============================================================================
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; color: #e6e6e6; overflow: hidden;
+    overscroll-behavior: none; touch-action: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #app { position: fixed; inset: 0; display: flex; flex-direction: column; }
+  #canvas { flex: 1 1 auto; display: block; width: 100%; height: 100%; touch-action: none; }
+  #title {
+    position: absolute; top: env(safe-area-inset-top, 8px); left: 0; right: 0;
+    text-align: center; font-size: 13px; letter-spacing: .04em; color: #9aa; pointer-events: none;
+    padding-top: 6px;
+  }
+  #badge {
+    position: absolute; top: calc(env(safe-area-inset-top, 8px) + 26px); left: 50%;
+    transform: translateX(-50%); font-size: 11px; color: #ffb74d;
+    background: rgba(0,0,0,.4); padding: 2px 8px; border-radius: 10px;
+    pointer-events: none; opacity: 0; transition: opacity .2s;
+  }
+  #controls {
+    position: absolute; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom, 10px) + 6px);
+    display: flex; gap: 10px; justify-content: center; align-items: center; padding: 0 12px;
+  }
+  button {
+    appearance: none; border: 1px solid #2c3440; background: #11161d; color: #e6e6e6;
+    font-size: 16px; padding: 12px 18px; border-radius: 12px; min-width: 96px;
+    touch-action: manipulation; transition: background .15s, transform .05s;
+  }
+  button:active { transform: scale(.97); }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600; }
+  button.stop { background: #b3231f; border-color: #b3231f; color: #fff; }
+  button:disabled { opacity: .45; }
+  button.small { font-size: 13px; padding: 9px 12px; min-width: 0; }
+  #stats {
+    position: absolute; top: calc(env(safe-area-inset-top, 8px) + 50px); left: 10px;
+    background: rgba(8,11,16,.78); border: 1px solid #1d2530; border-radius: 10px;
+    padding: 10px 12px; font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    color: #cdd6e0; display: none; min-width: 188px; pointer-events: none;
+  }
+  #stats b { color: #fff; font-weight: 600; }
+  #stats .row { display: flex; justify-content: space-between; gap: 14px; }
+  #stats .k { color: #7c8896; }
+  #overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    background: radial-gradient(ellipse at center, rgba(20,26,34,.6), rgba(0,0,0,.92));
+    text-align: center; padding: 24px;
+  }
+  #overlay h1 { font-size: 19px; font-weight: 600; margin: 0; color: #fff; }
+  #overlay p { font-size: 13px; color: #93a0ad; max-width: 320px; margin: 0; line-height: 1.5; }
+  #progressWrap { width: 240px; display: none; }
+  #progressBar { height: 7px; background: #1b2230; border-radius: 4px; overflow: hidden; }
+  #progressFill { height: 100%; width: 0%; background: linear-gradient(90deg, #1f6feb, #56b6c2); transition: width .12s; }
+  #progressLabel { font-size: 11px; color: #7c8896; margin-top: 6px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="canvas"></canvas>
+  <div id="title">OA ring-attractor &middot; neural compass</div>
+  <div id="badge">SLOW-MO</div>
+
+  <div id="overlay">
+    <h1>Neural Compass</h1>
+    <p>A neural-field ring attractor that path-integrates your phone&rsquo;s heading.
+       Tap Start, allow motion access, then turn your body. The bright bump should
+       track your heading; the thin top line marks north.</p>
+    <button id="startBtn" class="primary">Start</button>
+    <div id="progressWrap">
+      <div id="progressBar"><div id="progressFill"></div></div>
+      <div id="progressLabel">Seeding bump&hellip;</div>
+    </div>
+    <p id="hint" style="font-size:11px;color:#5d6772"></p>
+  </div>
+
+  <div id="stats">
+    <div class="row"><span class="k">heading &phi;</span><b id="sPhi">&mdash;</b></div>
+    <div class="row"><span class="k">command &Phi;</span><b id="sCmd">&mdash;</b></div>
+    <div class="row"><span class="k">gain k</span><b id="sGain">&mdash;</b></div>
+    <div class="row"><span class="k">&omega; (deg/s)</span><b id="sOmega">&mdash;</b></div>
+    <div class="row"><span class="k">steps/tick</span><b id="sSteps">&mdash;</b></div>
+    <div class="row"><span class="k">max r</span><b id="sMaxr">&mdash;</b></div>
+  </div>
+
+  <div id="controls" class="hidden">
+    <button id="stopBtn" class="stop small">Stop</button>
+    <button id="statsBtn" class="small">Stats</button>
+    <button id="flipBtn" class="small">Flip dir</button>
+  </div>
+</div>
+
+<!-- ======================= SIMULATION WORKER (inlined) ======================= -->
+<script id="worker" type="javascript/worker">
+'use strict';
+//=============================================================================
+// OA / MPR neural-field ring attractor. All math ported from field.jl /
+// moving.jl / pathint.jl per notes/browser_pathint_implementation_brief.md.
+//=============================================================================
+
+// ---- Parameters (operating point: Laing Fig 1c moving-bump, run_pathint.jl) --
+const N        = 256;          // ring nodes (Nx)
+const dt       = 0.02;         // RK4 step, dimensionless model time. DO NOT inflate.
+const Delta    = 0.1;          // Lorentzian HWHM of excitability disorder
+const etabar   = -0.4;         // median excitability
+const kappa    = 2.0;          // overall coupling gain (applied in RHS, not coupling)
+const beta     = 1/3.91;       // omega(model) -> B calibration (unity small-signal PI gain)
+const BMAX     = 0.085;        // clamp B inside monostable band (notes §10)
+
+// ---- Real-time <-> model-time scaling (notes §9.1) --------------------------
+//   tau_m = membrane time constant. 1 real second -> (1/tau_m) model time units.
+//   Default tau_m = 10 ms  =>  SIM_PER_REAL = 100 model-time-units per real second.
+//   omega_model = omega_real / SIM_PER_REAL ;  B = beta * omega_model.
+const TAU_M        = 0.010;            // seconds  (tunable: larger => slower sim clock)
+const SIM_PER_REAL = 1 / TAU_M;        // = 100 model time units per wall-clock second
+
+// ---- Mobile safety: cap work per tick; accept slow-mo rather than freeze -----
+const MAX_STEPS_PER_TICK = 200;        // hard cap (notes §9.1: cap, don't inflate dt)
+const TARGET_TICK_MS     = 16;         // ~60 Hz cadence target
+const MAX_DTREAL         = 0.25;       // clamp real dt (survives tab backgrounding)
+
+// ---- Seeding protocol (moving.jl seed_field_bump) ---------------------------
+const T_KICK = 20, T_FREE = 200;
+const KICK_STEPS   = Math.round(T_KICK / dt);   // 1000
+const SETTLE_STEPS = Math.round(T_FREE / dt);   // 10000
+const KICK_A = 0.6, KICK_SIG = 0.6, KICK_X0 = Math.PI;
+
+const TWO_PI  = 2 * Math.PI;
+const measure = TWO_PI / N;            // (2 pi / Nx) integration measure — essential
+const INV_PI  = 1 / Math.PI;
+
+// ---- Grid (field.jl:27 ; JS convention x[j]=2pi*j/Nx, j=0..N-1) -------------
+const x = new Float64Array(N), cosx = new Float64Array(N), sinx = new Float64Array(N);
+for (let j = 0; j < N; j++) { x[j] = TWO_PI * j / N; cosx[j] = Math.cos(x[j]); sinx[j] = Math.sin(x[j]); }
+
+// ---- State + preallocated work buffers (zero per-step allocation) -----------
+const zr = new Float64Array(N), zi = new Float64Array(N);
+const k1r = new Float64Array(N), k1i = new Float64Array(N);
+const k2r = new Float64Array(N), k2i = new Float64Array(N);
+const k3r = new Float64Array(N), k3i = new Float64Array(N);
+const k4r = new Float64Array(N), k4i = new Float64Array(N);
+const tr  = new Float64Array(N), ti  = new Float64Array(N);
+const Ifield = new Float64Array(N);
+const Iext   = new Float64Array(N);    // seeding kick only; 0 during live drive
+const rate   = new Float64Array(N);
+
+const dt2 = 0.5 * dt, dt6 = dt / 6;
+
+// ============================================================================
+// Coupling field  I[j] = (2pi/N) * sum_k K(x_j - x_k) * P_k     (field.jl:57-62)
+// K has ONLY Fourier modes {0,+1,-1}, so the circular convolution is exactly:
+//   I_j = (2pi/N)[ 0.1*S0 + 0.3(cos x_j Sc + sin x_j Ss) + B(sin x_j Sc - cos x_j Ss) ]
+// with S0=sum P, Sc=sum P cos x, Ss=sum P sin x. This is identical (to round-off)
+// to ifft(Khat⊙fft(P))*(2pi/N) because Khat is zero outside bins {0,±1}. No FFT.
+// P_k = meanpulse(z_k) = 1 - (4/3)Re z + (1/3)Re z^2   (field.jl:51, hard-coded n=2)
+// ============================================================================
+function coupling(ar, ai, B) {
+  let S0 = 0, Sc = 0, Ss = 0;
+  for (let j = 0; j < N; j++) {
+    const a = ar[j], b = ai[j];
+    const P = 1 - (4/3) * a + (1/3) * (a * a - b * b);   // meanpulse, real
+    S0 += P; Sc += P * cosx[j]; Ss += P * sinx[j];
+  }
+  const dc = measure * 0.1 * S0;        // DC term
+  const ec = measure * 0.3;             // symmetric (cos) lobe coefficient
+  const eb = measure * B;               // asymmetry (sin) coefficient -> translation
+  for (let j = 0; j < N; j++) {
+    Ifield[j] = dc + ec * (cosx[j] * Sc + sinx[j] * Ss)
+                   + eb * (sinx[j] * Sc - cosx[j] * Ss);
+  }
+}
+
+// ---- RHS (field.jl:66-70) :  ż = (i/2)(z-1)^2 - (1/2)(z+1)^2 [Delta + i f] ---
+//      f = etabar + kappa*(I[j] + Iext[j])
+function rhs(ar, ai, B, outr, outi) {
+  coupling(ar, ai, B);
+  for (let j = 0; j < N; j++) {
+    const a = ar[j], b = ai[j];
+    const f = etabar + kappa * (Ifield[j] + Iext[j]);
+    // term1 = (i/2)(z-1)^2
+    const t1r = -b * (a - 1);
+    const t1i = 0.5 * ((a - 1) * (a - 1) - b * b);
+    // W = (z+1)^2 * (Delta + i f)
+    const p = (a + 1) * (a + 1) - b * b;     // Re (z+1)^2
+    const q = 2 * b * (a + 1);               // Im (z+1)^2
+    const Wr = p * Delta - q * f;
+    const Wi = p * f + q * Delta;
+    outr[j] = t1r - 0.5 * Wr;
+    outi[j] = t1i - 0.5 * Wi;
+  }
+}
+
+// ---- One RK4 step. B is piecewise-constant across the (sub-frame) step, so the
+//      four stages share it; structurally this is the stage-time RK4 of pathint.jl
+//      field_step_tv with B(t)=B(t+dt/2)=B(t+dt) within a frame (notes §9). ----
+let maxAbsZ = 0;
+function step(B) {
+  rhs(zr, zi, B, k1r, k1i);
+  for (let j = 0; j < N; j++) { tr[j] = zr[j] + dt2 * k1r[j]; ti[j] = zi[j] + dt2 * k1i[j]; }
+  rhs(tr, ti, B, k2r, k2i);
+  for (let j = 0; j < N; j++) { tr[j] = zr[j] + dt2 * k2r[j]; ti[j] = zi[j] + dt2 * k2i[j]; }
+  rhs(tr, ti, B, k3r, k3i);
+  for (let j = 0; j < N; j++) { tr[j] = zr[j] + dt * k3r[j];  ti[j] = zi[j] + dt * k3i[j]; }
+  rhs(tr, ti, B, k4r, k4i);
+  for (let j = 0; j < N; j++) {
+    zr[j] += dt6 * (k1r[j] + 2 * k2r[j] + 2 * k3r[j] + k4r[j]);
+    zi[j] += dt6 * (k1i[j] + 2 * k2i[j] + 2 * k3i[j] + k4i[j]);
+  }
+}
+
+// ---- Firing rate (field.jl:34, Laing Eq.9):  r = (1/pi) Re[(1-z)/(1+z)] ------
+function computeRate() {
+  let mx = 0;
+  for (let j = 0; j < N; j++) {
+    const a = zr[j], b = zi[j];
+    let den = (1 + a) * (1 + a) + b * b;       // guard against z -> -1
+    if (den < 1e-9) den = 1e-9;
+    const r = INV_PI * (1 - a * a - b * b) / den;
+    rate[j] = r;
+    if (r > mx) mx = r;
+  }
+  return mx;
+}
+
+// ---- Bump centroid (moving.jl:34): arg sum_j r_j e^{i x_j}, on firing rate ---
+function centroid() {
+  let cr = 0, ci = 0;
+  for (let j = 0; j < N; j++) { cr += rate[j] * cosx[j]; ci += rate[j] * sinx[j]; }
+  return Math.atan2(ci, cr);
+}
+
+// ---- Rest state (field.jl:96-105): single population, NO coupling (I=0) ------
+function restState() {
+  let a = 0, b = 0;
+  const h = 0.005, steps = 40000;            // T=200
+  const g = (ar, ai) => {                     // returns [dr, di] with I=0,Iext=0
+    const f = etabar;
+    const t1r = -ai * (ar - 1), t1i = 0.5 * ((ar - 1) * (ar - 1) - ai * ai);
+    const p = (ar + 1) * (ar + 1) - ai * ai, q = 2 * ai * (ar + 1);
+    return [t1r - 0.5 * (p * Delta - q * f), t1i - 0.5 * (p * f + q * Delta)];
+  };
+  for (let s = 0; s < steps; s++) {
+    const [a1, b1] = g(a, b);
+    const [a2, b2] = g(a + 0.5 * h * a1, b + 0.5 * h * b1);
+    const [a3, b3] = g(a + 0.5 * h * a2, b + 0.5 * h * b2);
+    const [a4, b4] = g(a + h * a3, b + h * b3);
+    a += h / 6 * (a1 + 2 * a2 + 2 * a3 + a4);
+    b += h / 6 * (b1 + 2 * b2 + 2 * b3 + b4);
+  }
+  return [a, b];
+}
+
+function angDist(xa, xb) { let d = Math.abs(xa - xb); return Math.min(d, TWO_PI - d); }
+
+// ---- Seed bump: rest fill -> Gaussian kick -> free settle (moving.jl:99-106) -
+function seedRestAndKick() {
+  const [ar, br] = restState();
+  for (let j = 0; j < N; j++) { zr[j] = ar; zi[j] = br; }
+  for (let j = 0; j < N; j++) {
+    const d = angDist(x[j], KICK_X0);
+    Iext[j] = KICK_A * Math.exp(-d * d / (2 * KICK_SIG * KICK_SIG));
+  }
+  for (let s = 0; s < KICK_STEPS; s++) step(0);   // B=0 during seeding
+  Iext.fill(0);
+}
+
+// ============================================================================
+// Live-drive state
+// ============================================================================
+let running = false, devMode = false;
+let omegaReal = 0;          // rad/s, latest smoothed compass angular velocity (from main)
+let signFlip  = 1;          // ±1 (Flip dir button); notes §10: flip sign of beta if needed
+let tModel = 0;
+let headingUnwrapped = 0, prevCentroid = 0, commanded = 0;
+let liveInited = false;
+let lastNow = 0;
+const gainHist = [];        // {t, h, c} over last 2 model-time units
+
+function postFrame(steps, rtf, mx) {
+  const c = centroid();
+  if (!liveInited) { prevCentroid = c; headingUnwrapped = c; commanded = c; liveInited = true; }
+  // unwrap centroid across frames (moving.jl:40, shortest-arc)
+  let d = c - prevCentroid; d -= TWO_PI * Math.round(d / TWO_PI);
+  headingUnwrapped += d; prevCentroid = c;
+  // rolling gain over last 2 model time units: k = dphi/dt / omega = dh/dc
+  gainHist.push({ t: tModel, h: headingUnwrapped, c: commanded });
+  while (gainHist.length > 1 && gainHist[0].t < tModel - 2) gainHist.shift();
+  let gain = NaN;
+  if (gainHist.length >= 2) {
+    const f0 = gainHist[0], f1 = gainHist[gainHist.length - 1];
+    const dcm = f1.c - f0.c;
+    if (Math.abs(dcm) > 1e-4) gain = (f1.h - f0.h) / dcm;
+  }
+  const buf = new Float32Array(N);
+  for (let j = 0; j < N; j++) buf[j] = rate[j];
+  self.postMessage({
+    type: 'frame', rate: buf, centroid: c, heading: headingUnwrapped,
+    commanded: commanded, gain: gain, steps: steps, rtf: rtf, maxr: mx
+  }, [buf.buffer]);
+}
+
+function liveTick() {
+  if (!running) return;
+  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let dtReal = (now - lastNow) / 1000; lastNow = now;
+  if (!(dtReal > 0)) dtReal = 0.001;
+  if (dtReal > MAX_DTREAL) dtReal = MAX_DTREAL;
+
+  // model time to advance this frame, and the RK4 step count for it (notes §9.1)
+  const requested = Math.round(dtReal * SIM_PER_REAL / dt);
+  let steps = requested;
+  if (steps > MAX_STEPS_PER_TICK) steps = MAX_STEPS_PER_TICK;   // cap -> slow-mo
+  if (steps < 1) steps = 1;
+  const rtf = requested > 0 ? steps / requested : 1;            // realtime factor (<1 = slow-mo)
+
+  const omegaModel = (omegaReal / SIM_PER_REAL) * signFlip;
+  let B = beta * omegaModel;
+  if (B >  BMAX) B =  BMAX;                                     // monostable-band clamp
+  if (B < -BMAX) B = -BMAX;
+
+  const t0 = now;
+  for (let i = 0; i < steps; i++) { step(B); tModel += dt; commanded += omegaModel * dt; }
+  const mx = computeRate();
+  if (devMode && maxAbsZ > 1.0001) { console.warn('[OA] |z|>1 violated: ' + maxAbsZ.toFixed(4)); maxAbsZ = 0; }
+  postFrame(steps, rtf, mx);
+
+  const compute = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+  const delay = Math.max(0, TARGET_TICK_MS - compute);
+  setTimeout(liveTick, delay);
+}
+
+// ---- chunked settle so progress can stream + worker stays responsive --------
+let settleRemaining = 0;
+function settleChunk() {
+  const chunk = Math.min(1000, settleRemaining);
+  for (let i = 0; i < chunk; i++) {
+    step(0);
+    if (devMode) { for (let j = 0; j < N; j++) { const m = Math.hypot(zr[j], zi[j]); if (m > maxAbsZ) maxAbsZ = m; } }
+  }
+  settleRemaining -= chunk;
+  self.postMessage({ type: 'progress', frac: 1 - settleRemaining / SETTLE_STEPS });
+  if (settleRemaining > 0) { setTimeout(settleChunk, 0); }
+  else { afterSeed(); }
+}
+
+function devChecks() {
+  const mx = computeRate();
+  const c = centroid();
+  console.log('[OA dev] post-seed maxRate=' + mx.toFixed(4) + ' centroid=' + c.toFixed(4) + ' (target ~pi)');
+  console.assert(mx > 0.1, '[OA] max rate should exceed 0.1, got ' + mx);
+  console.assert(angDist(c, Math.PI) < 0.3, '[OA] centroid should be near pi, got ' + c);
+  // constant-omega gain check: drive Omega=0.10 model units for 50 model time units.
+  // Accumulate displacement with per-sample unwrapping — over 50 t.u. the bump travels
+  // ~5 rad (>2pi shortest-arc would wrap), so a single endpoint diff would be wrong.
+  computeRate(); let prevc = centroid(), disp = 0;
+  const Btest = beta * 0.10, nstep = Math.round(50 / dt);
+  for (let s = 0; s < nstep; s++) {
+    step(Btest);
+    if (s % 10 === 0) { computeRate(); const cc = centroid(); let dd = cc - prevc; dd -= TWO_PI * Math.round(dd / TWO_PI); disp += dd; prevc = cc; }
+  }
+  computeRate(); { const cc = centroid(); let dd = cc - prevc; dd -= TWO_PI * Math.round(dd / TWO_PI); disp += dd; }
+  const ratio = disp / (0.10 * 50);
+  console.log('[OA dev] gain check: displacement=' + disp.toFixed(4) + ' ratio=' + ratio.toFixed(3) + ' (want 0.8..1.2)');
+  console.assert(ratio > 0.8 && ratio < 1.2, '[OA] unity-gain check failed, ratio=' + ratio);
+}
+
+function afterSeed() {
+  if (devMode) {
+    devChecks();
+    // re-seed clean after the gain test perturbed the bump
+    self.postMessage({ type: 'progress', frac: 0.0, label: 'Re-seeding (dev)…' });
+    seedRestAndKick();
+    settleRemaining = SETTLE_STEPS;
+    devMode = false;            // skip a second dev check
+    settleChunk();
+    return;
+  }
+  computeRate();
+  running = true; liveInited = false; tModel = 0;
+  lastNow = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  self.postMessage({ type: 'ready' });
+  liveTick();
+}
+
+self.onmessage = function (e) {
+  const m = e.data;
+  if (m.type === 'start') {
+    devMode = !!m.dev;
+    self.postMessage({ type: 'progress', frac: 0, label: 'Seeding bump…' });
+    seedRestAndKick();
+    settleRemaining = SETTLE_STEPS;
+    settleChunk();
+  } else if (m.type === 'omega') {
+    omegaReal = m.value;
+  } else if (m.type === 'flip') {
+    signFlip = -signFlip;
+  } else if (m.type === 'stop') {
+    running = false;
+  }
+};
+</script>
+
+<!-- ============================ MAIN THREAD ================================== -->
+<script>
+'use strict';
+(function () {
+  const DEV = /[?&]dev\b/.test(location.search);
+  const TWO_PI = 2 * Math.PI, RAD2DEG = 180 / Math.PI, N = 256;
+
+  // ---- DOM --------------------------------------------------------------
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const statsBtn = document.getElementById('statsBtn');
+  const flipBtn = document.getElementById('flipBtn');
+  const controls = document.getElementById('controls');
+  const statsEl = document.getElementById('stats');
+  const progressWrap = document.getElementById('progressWrap');
+  const progressFill = document.getElementById('progressFill');
+  const progressLabel = document.getElementById('progressLabel');
+  const badge = document.getElementById('badge');
+  const hint = document.getElementById('hint');
+  const sPhi = document.getElementById('sPhi'), sCmd = document.getElementById('sCmd');
+  const sGain = document.getElementById('sGain'), sOmega = document.getElementById('sOmega');
+  const sSteps = document.getElementById('sSteps'), sMaxr = document.getElementById('sMaxr');
+
+  // ---- Viridis lookup table (perceptually uniform, built from 9 anchors) ----
+  const VIR_ANCHORS = [
+    [68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],
+    [31,158,137],[53,183,121],[110,206,88],[253,231,37]
+  ];
+  const LUT = new Uint8Array(256 * 3);
+  (function buildLUT() {
+    const segs = VIR_ANCHORS.length - 1;
+    for (let i = 0; i < 256; i++) {
+      const t = i / 255 * segs, k = Math.min(segs - 1, Math.floor(t)), f = t - k;
+      const c0 = VIR_ANCHORS[k], c1 = VIR_ANCHORS[k + 1];
+      LUT[i*3]   = (c0[0] + (c1[0] - c0[0]) * f) | 0;
+      LUT[i*3+1] = (c0[1] + (c1[1] - c0[1]) * f) | 0;
+      LUT[i*3+2] = (c0[2] + (c1[2] - c0[2]) * f) | 0;
+    }
+  })();
+
+  // ---- precomputed ring node angles ------------------------------------
+  const nodeAng = new Float64Array(N);
+  for (let j = 0; j < N; j++) nodeAng[j] = TWO_PI * j / N;
+  // Map ring angle theta -> canvas angle: north (theta=0) at top, increasing clockwise.
+  function canvasAngle(theta) { return Math.PI / 2 - theta; }
+
+  // ---- Worker from inlined blob ----------------------------------------
+  const workerSrc = document.getElementById('worker').textContent;
+  const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'application/javascript' })));
+
+  // ---- latest frame data + dirty flag ----------------------------------
+  let latestRate = new Float32Array(N);
+  let latestCentroid = 0, latestHeading = 0, latestCommanded = 0;
+  let latestGain = NaN, latestSteps = 0, latestRtf = 1, latestMaxr = 0;
+  let haveFrame = false, isRunning = false;
+
+  worker.onmessage = function (e) {
+    const m = e.data;
+    if (m.type === 'progress') {
+      progressWrap.style.display = 'block';
+      progressFill.style.width = (m.frac * 100).toFixed(1) + '%';
+      if (m.label) progressLabel.textContent = m.label;
+    } else if (m.type === 'ready') {
+      isRunning = true;
+      overlay.classList.add('hidden');
+      controls.classList.remove('hidden');
+      armSensorFallback();
+    } else if (m.type === 'frame') {
+      latestRate = m.rate;
+      latestCentroid = m.centroid; latestHeading = m.heading; latestCommanded = m.commanded;
+      latestGain = m.gain; latestSteps = m.steps; latestRtf = m.rtf; latestMaxr = m.maxr;
+      haveFrame = true;
+    }
+  };
+
+  // ---- canvas sizing (DPR capped at 2 for fill cost on phones) ----------
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---- Render loop (main thread only renders) --------------------------
+  function render() {
+    requestAnimationFrame(render);
+    if (!haveFrame) return;
+    ctx.clearRect(0, 0, W, H);
+    const cx = W / 2, cy = H / 2;
+    const R = Math.min(W, H) * 0.43, Rin = R * 0.58;
+
+    // auto-range firing rate for max bump contrast this frame
+    let rmin = Infinity, rmax = -Infinity;
+    for (let j = 0; j < N; j++) { const r = latestRate[j]; if (r < rmin) rmin = r; if (r > rmax) rmax = r; }
+    const span = (rmax - rmin) || 1e-9;
+
+    const half = Math.PI / N;
+    for (let j = 0; j < N; j++) {
+      let v = (latestRate[j] - rmin) / span; if (v < 0) v = 0; else if (v > 1) v = 1;
+      const idx = (v * 255) | 0;
+      ctx.fillStyle = 'rgb(' + LUT[idx*3] + ',' + LUT[idx*3+1] + ',' + LUT[idx*3+2] + ')';
+      // annular sector between the two node-edge angles. Negate canvasAngle (canvas
+      // y is down); -a1 < -a2 with a tiny gap 2pi/N, so outer arc goes the SHORT way
+      // (anticlockwise=false), inner arc returns (anticlockwise=true).
+      const s = -canvasAngle(nodeAng[j] - half), e = -canvasAngle(nodeAng[j] + half);
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, s, e, false);
+      ctx.arc(cx, cy, Rin, e, s, true);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // north / 0-heading reference line (top)
+    const na = canvasAngle(0);
+    ctx.strokeStyle = 'rgba(230,230,230,0.55)'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Rin * Math.cos(-na), cy + Rin * Math.sin(-na));
+    ctx.lineTo(cx + (R + 14) * Math.cos(-na), cy + (R + 14) * Math.sin(-na));
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(230,230,230,0.65)';
+    ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('N', cx, cy - (R + 22));
+
+    // commanded heading marker (faint amber tick = integral of compass)
+    drawTick(cx, cy, R, Rin, latestCommanded, 'rgba(255,183,77,0.6)', 2);
+    // decoded bump centroid (bright white dot + needle)
+    const bc = canvasAngle(latestCentroid);
+    const mr = (R + Rin) / 2;
+    const bx = cx + mr * Math.cos(-bc), by = cy + mr * Math.sin(-bc);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(bx, by); ctx.stroke();
+    ctx.beginPath(); ctx.arc(bx, by, 7, 0, TWO_PI);
+    ctx.fillStyle = '#fff'; ctx.shadowColor = '#fff'; ctx.shadowBlur = 16; ctx.fill(); ctx.shadowBlur = 0;
+
+    badge.style.opacity = (latestRtf < 0.9) ? '1' : '0';
+
+    if (statsEl.style.display === 'block') {
+      sPhi.textContent = norm360(latestHeading * RAD2DEG).toFixed(1) + '°';
+      sCmd.textContent = norm360(latestCommanded * RAD2DEG).toFixed(1) + '°';
+      sGain.textContent = isFinite(latestGain) ? latestGain.toFixed(3) : '—';
+      sOmega.textContent = (smoothedOmega * RAD2DEG).toFixed(1);
+      sSteps.textContent = latestSteps + (latestRtf < 0.9 ? ' (slow)' : '');
+      sMaxr.textContent = latestMaxr.toFixed(3);
+    }
+  }
+  function drawTick(cx, cy, R, Rin, theta, color, w) {
+    const a = canvasAngle(theta);
+    ctx.strokeStyle = color; ctx.lineWidth = w;
+    ctx.beginPath();
+    ctx.moveTo(cx + Rin * Math.cos(-a), cy + Rin * Math.sin(-a));
+    ctx.lineTo(cx + R * Math.cos(-a), cy + R * Math.sin(-a));
+    ctx.stroke();
+  }
+  function norm360(d) { d = d % 360; return d < 0 ? d + 360 : d; }
+
+  // ===================== Compass input (DeviceOrientation) =================
+  let prevRad = null, prevT = null, smoothedOmega = 0, gotOrientation = false;
+  const EMA = 0.2;
+  function onOrientation(ev) {
+    let hdg = null;
+    if (typeof ev.webkitCompassHeading === 'number' && !isNaN(ev.webkitCompassHeading)) {
+      hdg = ev.webkitCompassHeading;            // iOS: degrees, 0=N, clockwise
+    } else if (typeof ev.alpha === 'number' && ev.alpha !== null) {
+      hdg = 360 - ev.alpha;                     // Android standard API fallback
+    }
+    if (hdg === null) return;
+    gotOrientation = true;
+    const t = performance.now() / 1000, rad = hdg * Math.PI / 180;
+    if (prevRad !== null && prevT !== null) {
+      const dtr = t - prevT;
+      if (dtr > 0) {
+        let d = rad - prevRad; d -= TWO_PI * Math.round(d / TWO_PI);   // shortest-arc unwrap
+        const wraw = d / dtr;                                          // rad/s
+        smoothedOmega = EMA * wraw + (1 - EMA) * smoothedOmega;        // jitter EMA
+        worker.postMessage({ type: 'omega', value: smoothedOmega });
+      }
+    }
+    prevRad = rad; prevT = t;
+  }
+
+  async function requestOrientation() {
+    try {
+      const D = window.DeviceOrientationEvent;
+      if (D && typeof D.requestPermission === 'function') {     // iOS 13+ gesture gate
+        const res = await D.requestPermission();
+        if (res !== 'granted') { hint.textContent = 'Motion access denied — drag the ring to steer.'; return false; }
+      }
+      window.addEventListener('deviceorientation', onOrientation, true);
+      return true;
+    } catch (err) { hint.textContent = 'No compass — drag the ring to steer.'; return false; }
+  }
+
+  // ---- Fallback: if no real orientation events arrive, allow drag-to-steer ----
+  function armSensorFallback() {
+    setTimeout(() => {
+      if (!gotOrientation) { hint.textContent = 'No compass detected — drag across the ring to steer.'; enableDragSteer(); }
+    }, 1500);
+  }
+  function enableDragSteer() {
+    let lastX = null, lastT = null, decayTimer = null;
+    function send(v) { smoothedOmega = v; worker.postMessage({ type: 'omega', value: v }); }
+    function down(e) { lastX = (e.touches ? e.touches[0].clientX : e.clientX); lastT = performance.now(); }
+    function move(e) {
+      if (lastX === null) return;
+      const xx = (e.touches ? e.touches[0].clientX : e.clientX), now = performance.now();
+      const dx = xx - lastX, dtr = (now - lastT) / 1000;
+      if (dtr > 0) { send((dx / (W * 0.5)) / dtr * 0.6); }   // px velocity -> rad/s
+      lastX = xx; lastT = now;
+      if (decayTimer) clearTimeout(decayTimer);
+      decayTimer = setTimeout(() => send(0), 90);            // stop turning when finger stops
+      e.preventDefault();
+    }
+    function up() { lastX = null; send(0); }
+    canvas.addEventListener('touchstart', down, { passive: true });
+    canvas.addEventListener('touchmove', move, { passive: false });
+    canvas.addEventListener('touchend', up);
+    canvas.addEventListener('mousedown', down);
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  }
+
+  // ===================== UI wiring ========================================
+  startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+    startBtn.textContent = 'Starting…';
+    resize();
+    await requestOrientation();             // must be in the user-gesture chain (iOS)
+    worker.postMessage({ type: 'start', dev: DEV });
+  });
+  stopBtn.addEventListener('click', () => {
+    worker.postMessage({ type: 'stop' });
+    isRunning = false;
+    controls.classList.add('hidden');
+    overlay.classList.remove('hidden');
+    progressWrap.style.display = 'none';
+    startBtn.disabled = false; startBtn.textContent = 'Start';
+    hint.textContent = '';
+  });
+  statsBtn.addEventListener('click', () => {
+    statsEl.style.display = (statsEl.style.display === 'block') ? 'none' : 'block';
+  });
+  flipBtn.addEventListener('click', () => worker.postMessage({ type: 'flip' }));
+
+  resize();
+  requestAnimationFrame(render);
+  if (DEV) console.log('[OA] dev mode: console assertions + unity-gain test enabled.');
+})();
+</script>
+</body>
+</html>
